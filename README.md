@@ -1,2 +1,2 @@
-# tap
+# TapLib
 Test Anything Protocol
