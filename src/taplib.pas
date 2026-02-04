@@ -5,40 +5,46 @@ unit TapLib;
 interface
 
 uses
-  SysUtils;
+  SysUtils, TestReporter;
 
 type
   TTestProc = procedure;
+  TReporterType = (rtTAP, rtJUnit, rtGitHubActions);
+
+procedure set_reporter(AReporter: TTestReporter);
+procedure set_reporter(AReporterType: TReporterType);
+procedure add_reporter(AReporter: TTestReporter);
 
 procedure start_tests;
 procedure end_tests;
 
-procedure start_unit(const unitname: string);
+procedure start_unit(const AUnitName: string);
 procedure end_unit;
 
-procedure register_test(const testname: string; proc: TTestProc = nil);
-procedure register_subtest(const testname: string; proc: TTestProc);
+procedure register_test(const ATestName: string; AProc: TTestProc = nil);
+procedure register_subtest(const ATestName: string; AProc: TTestProc);
 procedure run_tests;
 
-procedure assert_equal(const testname: string; expected, got: longint);
-procedure assert_equal(const testname: string; expected, got: string);
-procedure assert_true(const testname: string; condition: boolean);
-procedure assert_false(const testname: string; condition: boolean);
-procedure assert_equal_files(const testname, expectedFile, gotFile: string);
+procedure assert_equal(const ATestName: string; AExpected, AGot: longint);
+procedure assert_equal(const ATestName: string; const AExpected, AGot: string);
+procedure assert_true(const ATestName: string; ACondition: boolean);
+procedure assert_false(const ATestName: string; ACondition: boolean);
+procedure assert_equal_files(const ATestName, AExpectedFile, AGotFile: string);
 
 implementation
 
 uses
-  Process, Classes;
+  Classes;
 
 type
-    TSubTestCase = record
-      name: string;
-      proc: TTestProc;
-    end;
+  pSubTestCase = ^TSubTestCase;
+  TSubTestCase = record
+    name: string;
+    proc: TTestProc;
+  end;
 
-    pTestCase = ^TTestCase;
-    TTestCase = record
+  pTestCase = ^TTestCase;
+  TTestCase = record
     name: string;
     proc: TTestProc;
     idx: longint;
@@ -46,7 +52,7 @@ type
   end;
 
   pUnit = ^TUnit;
-    TUnit = record
+  TUnit = record
     name: string;
     idx: longint;
     tests: array of TTestCase;
@@ -58,10 +64,11 @@ var
 
   current_unit: pUnit;
   current_test: pTestCase;
+  current_subtest: pSubTestCase;
 
   total_tests: longint = 0;
   main_tests: longint = 0;
-  subtest: boolean = false;
+  is_subtest: boolean = false;
 
   passed: longint = 0;
   failed: longint = 0;
@@ -69,47 +76,128 @@ var
   subtest_count: longint = 0;
   last_result: boolean;
 
-procedure print_pass; forward;
-procedure print_fail_header;  forward;
+  // Accumulator for multiple assertions per test
+  test_all_passed: boolean = true;
+  failures: TFailureArray;
+  failure_count: longint = 0;
+
+  // Reporter
+  reporter: TTestReporter = nil;
+  owns_reporter: boolean = false;
+
+procedure reset_test_state; forward;
+procedure finalize_test_output; forward;
+
+{----------------------------- Reporter management -----------------------------}
+
+procedure free_reporter;
+begin
+  if owns_reporter and (reporter <> nil) then
+    reporter.Free;
+  reporter := nil;
+  owns_reporter := false;
+end;
+
+procedure set_reporter(AReporter: TTestReporter);
+begin
+  free_reporter;
+  reporter := AReporter;
+  owns_reporter := false; // Caller owns it
+end;
+
+procedure set_reporter(AReporterType: TReporterType);
+begin
+  free_reporter;
+  case AReporterType of
+    rtTAP: reporter := TTAPReporter.Create;
+    rtJUnit: reporter := TJUnitReporter.Create;
+    rtGitHubActions: reporter := TGitHubActionsReporter.Create;
+  end;
+  owns_reporter := true;
+end;
+
+procedure add_reporter(AReporter: TTestReporter);
+var
+  multi: TMultiReporter;
+begin
+  if reporter = nil then
+  begin
+    reporter := AReporter;
+    owns_reporter := false;
+  end
+  else if reporter is TMultiReporter then
+  begin
+    TMultiReporter(reporter).AddReporter(AReporter);
+  end
+  else
+  begin
+    multi := TMultiReporter.Create(owns_reporter);
+    multi.AddReporter(reporter);
+    multi.AddReporter(AReporter);
+    reporter := multi;
+    owns_reporter := true;
+  end;
+end;
+
+procedure ensure_reporter;
+begin
+  if reporter = nil then
+  begin
+    reporter := TTAPReporter.Create;
+    owns_reporter := true;
+  end;
+end;
+
 {----------------------------- Unit management -----------------------------}
 
 procedure start_tests;
 begin
-  writeln('TAP version 14');
-  setlength(units, 0);
+  ensure_reporter;
+  SetLength(units, 0);
+  unit_count := 0;
+  total_tests := 0;
+  main_tests := 0;
+  passed := 0;
+  failed := 0;
+  test_count := 0;
+  subtest_count := 0;
+  current_unit := nil;
+  current_test := nil;
+  current_subtest := nil;
 end;
 
 procedure end_tests;
 begin
-  writeln('# tests ', total_tests);
-  writeln('# pass  ', passed);
-  writeln('# fail  ', failed);
+  reporter.EndTests(total_tests, passed, failed);
+  free_reporter;
   if failed > 0 then
     halt(1)
   else
     halt(0);
 end;
 
-procedure start_unit(const unitname: string);
+procedure start_unit(const AUnitName: string);
 begin
-  //add new unit
   inc(unit_count);
-  setlength(units, unit_count);
-  current_unit := @units[unit_count-1];
-  current_unit^.name:=unitname;
+  SetLength(units, unit_count);
+  current_unit := @units[unit_count - 1];
+  current_unit^.name := AUnitName;
+  current_unit^.idx := 0;
+  current_test := nil;
 end;
 
 procedure end_unit;
 begin
+  // Called explicitly by user if needed
 end;
 
 {----------------------------- Test registration -----------------------------}
 
-procedure register_test(const testname: string; proc: TTestProc = nil);
+procedure register_test(const ATestName: string; AProc: TTestProc = nil);
 begin
   if current_unit = nil then
   begin
-  writeln('error: no unit declared for test: ', testname);
+    writeln('error: no unit declared for test: ', ATestName);
     halt(-1);
   end;
 
@@ -117,18 +205,19 @@ begin
   inc(total_tests);
 
   inc(current_unit^.idx);
-  setlength(current_unit^.tests, current_unit^.idx);
+  SetLength(current_unit^.tests, current_unit^.idx);
 
-  current_test := @current_unit^.tests[current_unit^.idx-1];
-  current_test^.name := current_unit^.name + '::' + testname;
-  current_test^.proc := proc;
+  current_test := @current_unit^.tests[current_unit^.idx - 1];
+  current_test^.name := current_unit^.name + '::' + ATestName;
+  current_test^.proc := AProc;
+  current_test^.idx := 0;
 end;
 
-procedure register_subtest(const testname: string; proc: TTestProc);
+procedure register_subtest(const ATestName: string; AProc: TTestProc);
 begin
   if current_test = nil then
   begin
-    writeln('error: no test declared for subtest: ', testname);
+    writeln('error: no test declared for subtest: ', ATestName);
     halt(-1);
   end;
 
@@ -141,192 +230,180 @@ begin
   inc(total_tests);
 
   inc(current_test^.idx);
-  setlength(current_test^.subtests, current_test^.idx);
+  SetLength(current_test^.subtests, current_test^.idx);
 
-  current_test^.subtests[current_test^.idx-1].name := current_test^.name + '::' + testname;
-  current_test^.subtests[current_test^.idx-1].proc := proc;
+  current_test^.subtests[current_test^.idx - 1].name := current_test^.name + '::' + ATestName;
+  current_test^.subtests[current_test^.idx - 1].proc := AProc;
 end;
 
 {----------------------------- Test execution -----------------------------}
 
+procedure reset_test_state;
+begin
+  test_all_passed := true;
+  failure_count := 0;
+  SetLength(failures, 0);
+end;
+
+procedure finalize_test_output;
+var
+  count: longint;
+  name: string;
+begin
+  if is_subtest then
+  begin
+    count := subtest_count;
+    name := current_subtest^.name;
+  end
+  else
+  begin
+    count := test_count;
+    name := current_test^.name;
+  end;
+
+  if test_all_passed then
+  begin
+    inc(passed);
+    last_result := true;
+    reporter.TestPassed(name, count, is_subtest);
+  end
+  else
+  begin
+    inc(failed);
+    last_result := false;
+    reporter.TestFailed(name, count, is_subtest, failures);
+  end;
+end;
+
 procedure run_tests;
 var
   i, j, k: longint;
-  succes: boolean = true;
+  success: boolean;
 begin
-  writeln('1..', main_tests);
+  reporter.StartTests(main_tests);
 
-  //run units
-  for i := 0 to high(units) do
+  // Run units
+  for i := 0 to High(units) do
   begin
-    writeln('# ', units[i].name);
+    reporter.StartUnit(units[i].name);
 
-    //run tests
-    for j := 0 to units[i].idx-1 do
+    // Run tests
+    for j := 0 to units[i].idx - 1 do
     begin
-      subtest := false;
+      is_subtest := false;
       inc(test_count);
 
       current_test := @units[i].tests[j];
 
-      // run sub tests before tests
+      // Run subtests if any
       if current_test^.idx > 0 then
       begin
-         writeln('    1..', current_test^.idx);
+        reporter.StartSubtests(current_test^.idx);
 
-        //run subtests
+        success := true;
         subtest_count := 0;
-        for k:=0 to units[i].tests[j].idx-1 do
+        for k := 0 to current_test^.idx - 1 do
         begin
-          subtest := true;
+          is_subtest := true;
           inc(subtest_count);
 
-          current_test := @units[i].tests[j].subtests[k];
-          current_test^.proc;
+          current_subtest := @current_test^.subtests[k];
 
-          succes := succes and last_result;
+          reset_test_state;
+          current_subtest^.proc;
+          finalize_test_output;
+
+          success := success and last_result;
         end;
 
-        subtest := false;
-        current_test := @units[i].tests[j];
-        if succes then
-          print_pass
+        // Output parent test result
+        is_subtest := false;
+        if success then
+        begin
+          inc(passed);
+          reporter.TestPassed(current_test^.name, test_count, false);
+          last_result := true;
+        end
         else
-          print_fail_header
-
+        begin
+          inc(failed);
+          SetLength(failures, 0); // Empty failures for parent
+          reporter.TestFailed(current_test^.name, test_count, false, failures);
+          last_result := false;
+        end;
       end
       else
       begin
-        //run the test
+        // Run the test
+        reset_test_state;
         current_test^.proc;
+        finalize_test_output;
       end;
     end;
+
+    reporter.EndUnit;
   end;
 end;
 
 {----------------------------- Assertions -----------------------------}
 
-function indent: string;
+procedure record_failure(const ATestName, AOperator, AExpected, AGot: string);
 begin
-  if subtest then
-    exit('    ')
-  else
-    exit('');
+  test_all_passed := false;
+  inc(failure_count);
+  SetLength(failures, failure_count);
+  failures[failure_count - 1].testname := ATestName;
+  failures[failure_count - 1].operator_ := AOperator;
+  failures[failure_count - 1].expected := AExpected;
+  failures[failure_count - 1].got := AGot;
 end;
 
-function get_count: longint;
+procedure assert_equal(const ATestName: string; AExpected, AGot: longint);
 begin
-  if subtest then
-    exit(subtest_count)
-  else
-    exit(test_count);
+  if AExpected <> AGot then
+    record_failure(ATestName, 'equal', IntToStr(AExpected), IntToStr(AGot));
 end;
 
-procedure print_pass;
+procedure assert_equal(const ATestName: string; const AExpected, AGot: string);
 begin
-  inc(passed);
-  writeln(indent + 'ok ', get_count, ' - ', current_test^.name);
+  if AExpected <> AGot then
+    record_failure(ATestName, 'equal', '"' + AExpected + '"', '"' + AGot + '"');
 end;
 
-procedure print_fail_header;
+procedure assert_true(const ATestName: string; ACondition: boolean);
 begin
-  inc(failed);
-  writeln(indent + 'not ok ', get_count, ' - ', current_test^.name);
+  if not ACondition then
+    record_failure(ATestName, 'true', 'TRUE', 'FALSE');
 end;
 
-procedure print_fail(operator_: string; expected, got: longint);
+procedure assert_false(const ATestName: string; ACondition: boolean);
 begin
-  print_fail_header;
-  writeln(indent + '  ---');
-  writeln(indent + '    operator: ', operator_);
-  writeln(indent + '    expected: ', expected);
-  writeln(indent + '    actual:   ', got);
-  writeln(indent + '  ...');
-
-  last_result := true;
+  if ACondition then
+    record_failure(ATestName, 'false', 'FALSE', 'TRUE');
 end;
 
-procedure print_fail(operator_: string; expected, got: boolean);
-begin
-  print_fail_header;
-  writeln(indent + '  ---');
-  writeln(indent + '    operator: ', operator_);
-  writeln(indent + '    expected: ', expected);
-  writeln(indent + '    actual:   ', got);
-  writeln(indent + '  ...');
-
-  last_result := false;
-end;
-
-procedure assert_equal(const testname: string; expected, got: longint);
-begin
-  if expected = got then
-    print_pass
-  else
-    print_fail('equal', expected, got);
-end;
-
-procedure assert_equal(const testname: string; expected, got: string);
-var
-  pos: integer;
-begin
-  if expected = got then
-    print_pass
-  else
-  begin
-    print_fail_header;
-    writeln(indent + '  ---');
-    writeln(indent + '    operator: equal');
-    writeln(indent + '    expected: "', expected, '"');
-    writeln(indent + '    actual:   "', got, '"');
-    writeln(indent + '  ...');
-
-    last_result := false;
-  end;
-end;
-
-procedure assert_true(const testname: string; condition: boolean);
-begin
-  if condition then
-    print_pass
-  else
-    print_fail('true', true, false);
-end;
-
-procedure assert_false(const testname: string; condition: boolean);
-begin
-  if not condition then
-    print_pass
-  else
-    print_fail('false', false, true);
-end;
-
-procedure assert_equal_files(const testname, expectedFile, gotFile: string);
+procedure assert_equal_files(const ATestName, AExpectedFile, AGotFile: string);
 var
   expected, got: TStringList;
   i, maxLines: Integer;
-  ok: Boolean;
+  diffLines: string;
 begin
   expected := TStringList.Create;
   got := TStringList.Create;
   try
-    if FileExists(expectedFile) then
-      expected.LoadFromFile(expectedFile)
+    if FileExists(AExpectedFile) then
+      expected.LoadFromFile(AExpectedFile)
     else
       expected.Text := '';
 
-    if FileExists(gotFile) then
-      got.LoadFromFile(gotFile)
+    if FileExists(AGotFile) then
+      got.LoadFromFile(AGotFile)
     else
       got.Text := '';
 
-    ok := expected.Text = got.Text;
-    if ok then
-      print_pass
-    else
+    if expected.Text <> got.Text then
     begin
-      print_fail_header;
-      writeLn(indent + '# --- Diff between ', expectedFile, ' and ', gotFile, ' ---');
+      diffLines := '';
       maxLines := expected.Count;
       if got.Count > maxLines then
         maxLines := got.Count;
@@ -334,23 +411,21 @@ begin
       for i := 0 to maxLines - 1 do
       begin
         if (i >= expected.Count) then
-          WriteLn(indent + '# + ', got[i])                // extra line in got
+          diffLines := diffLines + '+' + got[i] + ' '
         else if (i >= got.Count) then
-          WriteLn(indent + '# - ', expected[i])           // missing line in got
+          diffLines := diffLines + '-' + expected[i] + ' '
         else if expected[i] <> got[i] then
-        begin
-          WriteLn(indent + '# - ', expected[i]);
-          WriteLn(indent + '# + ', got[i]);
-        end;
+          diffLines := diffLines + '-' + expected[i] + ' +' + got[i] + ' ';
       end;
-      WriteLn(indent + '# --- End diff ---');
-      last_result := false;
+
+      record_failure(ATestName, 'equal_files',
+        AExpectedFile + ' (' + IntToStr(expected.Count) + ' lines)',
+        AGotFile + ' (' + IntToStr(got.Count) + ' lines) diff: ' + diffLines);
     end;
   finally
     expected.Free;
     got.Free;
   end;
 end;
-
 
 end.
